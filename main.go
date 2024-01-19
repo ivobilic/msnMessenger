@@ -1,117 +1,61 @@
-// https://k33g.hashnode.dev/wazero-cookbook-part-two-host-functions#heading-create-a-new-host-application
-// // Package main of the host application
 package main
 
 import (
-	"context"
-	"fmt"
-	"log"
+	"flag"
 	"os"
 
-	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/api"
-	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
+	"github.com/eyedeekay/i2pkeys"
+	"github.com/eyedeekay/sam3"
+	_ "github.com/stealthrocket/net/wasip1"
 )
 
-// // PrintString : print a string to the console
-var PrintString = api.GoModuleFunc(func(ctx context.Context, module api.Module, stack []uint64) {
-
-	position := uint32(stack[0])
-	length := uint32(stack[1])
-
-	buffer, ok := module.Memory().Read(position, length)
-	if !ok {
-		log.Panicf("Memory.Read(%d, %d) out of range", position, length)
-	}
-	fmt.Println(string(buffer))
-})
-
 func main() {
-	//// Choose the context to use for function calls.
-	ctx := context.Background()
+	flag.Parse()
+	word := flag.Arg(0)
+	_, _ = os.Stdout.WriteString(word + "\n")
 
-	//// Create a new WebAssembly Runtime.
-	runtime := wazero.NewRuntime(ctx)
+	const samBridge = "127.0.0.1:7656"
 
-	//// This closes everything this Runtime created.
-	defer runtime.Close(ctx)
+	var sam, _ = sam3.NewSAM(samBridge)
+	defer sam.Close()
 
-	//// START: Host functions
-	builder := runtime.NewHostModuleBuilder("env")
+	var serverKeys, _ = sam.NewKeys()
+	var serverSession, _ = sam.NewStreamSession("serverWASI", serverKeys, sam3.Options_Wide)
 
-	//// hostPrintString
-	builder.NewFunctionBuilder().
-		WithGoModuleFunction(PrintString,
-			[]api.ValueType{
-				api.ValueTypeI32, //// string position
-				api.ValueTypeI32, //// string length
-			},
-			[]api.ValueType{api.ValueTypeI32}).
-		Export("hostPrintString")
+	start := make(chan bool)
+	quit := make(chan bool)
 
-	_, err := builder.Instantiate(ctx)
-	if err != nil {
-		log.Panicln("Error with env module and host function(s):", err)
-	}
-	//// END: Host functions
+	go func(server i2pkeys.I2PAddr) { //// Start client session
+		sam, _ := sam3.NewSAM(samBridge)
+		defer func(clientSAM *sam3.SAM) {
+			_ = clientSAM.Close()
+		}(sam)
+		keys, _ := sam.NewKeys()
+		session, _ := sam.NewStreamSession("clientWASI", keys, sam3.Options_Wide)
 
-	//// Instantiate WASI
-	wasi_snapshot_preview1.MustInstantiate(ctx, runtime)
+		<-start // wait for the server to start listening
 
-	//// Load the WebAssembly module
-	wasmPath := "./wasm/waSAM.wasm"
-	helloWasm, err := os.ReadFile(wasmPath)
+		var connection *sam3.SAMConn
+		for { // may fail, depending on the I2P network
+			if conn, err := session.DialI2P(server); err != nil {
+				_, _ = os.Stdout.WriteString(err.Error() + "\n") // Can not reach peer
+			} else {
+				connection = conn
+				break
+			}
+		}
+		buf := make([]byte, 256)
+		n, _ := connection.Read(buf)
+		_, _ = os.Stdout.WriteString("\n" + string(buf[:n]) + "\n") // prints received message
 
-	if err != nil {
-		log.Panicln(err)
-	}
+		quit <- true //// waits for client to die, for example only
+	}(serverKeys.Addr()) //// end of client
 
-	mod, err := runtime.Instantiate(ctx, helloWasm)
-	if err != nil {
-		log.Panicln(err)
-	}
+	var streamListener, _ = serverSession.Listen() // STREAM STATUS RESULT=OK
+	start <- true
+	conn, _ := streamListener.Accept()
 
-	//// Get the reference to the WebAssembly function: "hello"
-	helloFunction := mod.ExportedFunction("hello")
+	_, _ = conn.Write([]byte(word))
 
-	//// Function parameter
-	name := "Bob Morane"
-	nameSize := uint64(len(name))
-
-	//// These function are exported by TinyGo
-	malloc := mod.ExportedFunction("malloc")
-	free := mod.ExportedFunction("free")
-
-	//// Allocate Memory for "Bob Morane"
-	results, err := malloc.Call(ctx, nameSize)
-	if err != nil {
-		log.Panicln(err)
-	}
-	namePosition := results[0]
-
-	defer free.Call(ctx, namePosition)
-
-	//// Copy "Bob Morane" to memory
-	if !mod.Memory().Write(uint32(namePosition), []byte(name)) {
-		log.Panicf("out of range of memory size")
-	}
-
-	//// Now, we can call "hello" with the position
-	//// and the size of "Bob Morane"
-	//// the result type is []uint64
-	result, err := helloFunction.Call(ctx, namePosition, nameSize)
-	if err != nil {
-		log.Panicln(err)
-	}
-
-	//// Extract the position and size of the returned value
-	valuePosition := uint32(result[0] >> 32)
-	valueSize := uint32(result[0])
-
-	//// Read the value from the memory
-	if bytes, ok := mod.Memory().Read(valuePosition, valueSize); !ok {
-		log.Panicf("out of range of memory size")
-	} else {
-		fmt.Println("Returned value :", string(bytes))
-	}
+	<-quit
 }
